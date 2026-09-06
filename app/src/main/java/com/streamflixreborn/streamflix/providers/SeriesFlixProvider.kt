@@ -1,7 +1,6 @@
 package com.streamflixreborn.streamflix.providers
 
 import android.util.Base64
-import com.tanasi.retrofit_jsoup.converter.JsoupConverterFactory
 import com.streamflixreborn.streamflix.adapters.AppAdapter
 import com.streamflixreborn.streamflix.extractors.Extractor
 import com.streamflixreborn.streamflix.models.Category
@@ -10,390 +9,470 @@ import com.streamflixreborn.streamflix.models.Genre
 import com.streamflixreborn.streamflix.models.Movie
 import com.streamflixreborn.streamflix.models.People
 import com.streamflixreborn.streamflix.models.Season
-import com.streamflixreborn.streamflix.models.Show
 import com.streamflixreborn.streamflix.models.TvShow
 import com.streamflixreborn.streamflix.models.Video
-import com.streamflixreborn.streamflix.utils.DnsResolver
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
-import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
-import retrofit2.Retrofit
-import retrofit2.http.GET
-import retrofit2.http.Headers
-import retrofit2.http.Url
-import java.net.URLEncoder
+import okhttp3.Request
 import java.net.URLDecoder
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
-object SeriesFlixProvider : Provider {
+object SeriesFavCatalogProvider : Provider {
 
-    override val name = "SeriesFlix"
-    override val baseUrl = "https://seriesflixhd.lol"
-    override val logo = "https://s.seriesflixhd.lol/series/imgs/favicon-192.png"
+    override val name = "SeriesFav Catalog"
+    override val baseUrl =
+        "https://gist.githubusercontent.com/keiriblest/4634024c08cf2c794b4c6aa0b68ce7e8/raw/series-datos%20(1).json"
+    override val logo = "https://keiriblest.github.io/SeriesFav/desktop/favicon.ico"
     override val language = "es"
 
     private const val USER_AGENT =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-    private interface SeriesFlixService {
-        @Headers("User-Agent: $USER_AGENT")
-        @GET
-        suspend fun getPage(@Url url: String): Document
-    }
+    private data class ParsedEpisode(
+        val seasonNum: Int,
+        val episodeNum: Int,
+        val url: String
+    )
 
-    private val service: SeriesFlixService by lazy {
-        val client = OkHttpClient.Builder()
-            .dns(DnsResolver.doh)
-            .readTimeout(30, TimeUnit.SECONDS)
+    private data class SeriesFavEntry(
+        val titulo: String,
+        val imgURL: String?,
+        val temporada: String?,
+        val descripcion: String?,
+        val plataforma: String?,
+        val seccion: String?,
+        val fecha: String?,
+        val trailerURL: String?,
+        val isMovie: Boolean,
+        val entrySeasonNum: Int,
+        val directUrls: List<String>,
+        val episodesList: List<ParsedEpisode>
+    )
+
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
             .addInterceptor { chain ->
                 chain.proceed(
                     chain.request().newBuilder()
                         .header("User-Agent", USER_AGENT)
-                        .header("Referer", baseUrl)
                         .build()
                 )
             }
             .build()
-
-        Retrofit.Builder()
-            .baseUrl("$baseUrl/")
-            .addConverterFactory(JsoupConverterFactory.create())
-            .client(client)
-            .build()
-            .create(SeriesFlixService::class.java)
     }
 
-    override suspend fun getHome(): List<Category> {
-        val document = service.getPage(baseUrl)
-        val categories = mutableListOf<Category>()
+    private var cache: List<SeriesFavEntry> = emptyList()
 
-        document.select("section").forEach { section ->
-            val title = section.selectFirst(".Top .Title, .Top h2, .Top h3")?.text()?.trim().orEmpty()
-            if (title.isBlank()) return@forEach
+    private suspend fun fetchCatalog(): List<SeriesFavEntry> {
+        if (cache.isNotEmpty()) return cache
 
-            val items = when {
-                title.contains("Top 10", ignoreCase = true) ->
-                    section.select("ul.hometop10 li.mvnew").mapNotNull(::parseTopItem)
-                title.contains("Ultimos Episodios", ignoreCase = true) ||
-                    title.contains("Últimos Episodios", ignoreCase = true) ->
-                    section.select("article.TPost.B").mapNotNull(::parseEpisodeCard)
-                else ->
-                    section.select("article.TPost.B").mapNotNull(::parseShowCard)
+        return withContext(Dispatchers.IO) {
+            val request = Request.Builder()
+                .url("$baseUrl?t=${System.currentTimeMillis()}")
+                .get()
+                .build()
+
+            val body = runCatching {
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) response.body?.string() else null
+                }
+            }.getOrNull()
+
+            if (body.isNullOrBlank()) return@withContext emptyList()
+
+            val entries = parseJsonToEntries(body)
+
+            if (entries.isNotEmpty()) {
+                cache = entries
             }
 
-            if (items.isNotEmpty()) {
-                categories.add(Category(name = title, list = items))
+            entries
+        }
+    }
+
+    private fun isMovieCheck(tipo: String?, seccion: String?, plataforma: String?, temporada: String?): Boolean {
+        val t = tipo?.lowercase().orEmpty()
+        val s = seccion?.lowercase().orEmpty()
+        val p = plataforma?.lowercase().orEmpty()
+        val temp = temporada?.lowercase().orEmpty()
+
+        return t == "pelicula" || t == "peli" ||
+               s.contains("peli") || p.contains("peli") ||
+               temp.contains("peli")
+    }
+
+    private fun parseSeasonNumber(raw: String?): Int {
+        if (raw.isNullOrBlank()) return 1
+        val digits = raw.replace(Regex("[^0-9]"), "")
+        return digits.toIntOrNull() ?: 1
+    }
+
+    private fun parseEpisodeNumber(raw: String?): Int {
+        if (raw.isNullOrBlank()) return 1
+        val digits = raw.replace(Regex("[^0-9]"), "")
+        return digits.toIntOrNull() ?: 1
+    }
+
+    private fun parseJsonToEntries(rawJson: String): List<SeriesFavEntry> {
+        return runCatching {
+            val jsonElement = Json.parseToJsonElement(rawJson)
+
+            val array = when (jsonElement) {
+                is JsonArray -> jsonElement
+                is JsonObject -> {
+                    jsonElement.values.firstOrNull { it is JsonArray } as? JsonArray ?: JsonArray(emptyList())
+                }
+                else -> JsonArray(emptyList())
             }
-        }
 
-        return categories
-    }
+            array.mapNotNull { item ->
+                if (item !is JsonObject) return@mapNotNull null
 
-    override suspend fun search(query: String, page: Int): List<AppAdapter.Item> {
-        if (query.isBlank()) {
-            return getSearchGenres()
-        }
+                fun JsonObject.getFlexString(vararg keys: String): String? {
+                    for (key in keys) {
+                        val value = this[key] ?: continue
+                        if (value is JsonPrimitive) {
+                            val content = value.content.trim()
+                            if (content.isNotBlank() && content != "null") {
+                                return content
+                            }
+                        }
+                    }
+                    return null
+                }
 
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val url = if (page <= 1) {
-            "$baseUrl/?s=$encodedQuery"
-        } else {
-            "$baseUrl/page/$page/?s=$encodedQuery"
-        }
+                val titulo = item.getFlexString("titulo", "title", "name") ?: return@mapNotNull null
+                val imgURL = item.getFlexString("imgURL", "imgUrl", "poster", "image", "banner")
+                val temporada = item.getFlexString("temporada", "season")
+                val descripcion = item.getFlexString("descripcion", "overview", "description")
+                val plataforma = item.getFlexString("plataforma", "platform")
+                val seccion = item.getFlexString("seccion", "section", "category")
+                val fecha = item.getFlexString("fecha", "date", "year")
+                val trailerURL = item.getFlexString("trailerURL", "trailerUrl", "trailer")
+                val tipo = item.getFlexString("tipo", "type")
 
-        val document = service.getPage(url)
-        return document.select("article.TPost.B").mapNotNull { element ->
-            parseShowCard(element) ?: parseEpisodeCard(element)
-        }
-    }
+                val isMovie = isMovieCheck(tipo, seccion, plataforma, temporada)
+                val entrySeasonNum = parseSeasonNumber(temporada)
 
-    override suspend fun getMovies(page: Int): List<Movie> = emptyList()
+                val directUrls = mutableListOf<String>()
+                val parsedEpisodes = mutableListOf<ParsedEpisode>()
 
-    override suspend fun getTvShows(page: Int): List<TvShow> {
-        val document = service.getPage("$baseUrl/peliculas-online/series-online/page/$page")
-        return document.select("article.TPost.B").mapNotNull(::parseShowCard)
-    }
+                val verURLObj = item["verURL"] ?: item["verUrl"] ?: item["url"] ?: item["streamUrl"]
+                when (verURLObj) {
+                    is JsonPrimitive -> {
+                        val str = verURLObj.content.trim()
+                        if (str.isNotBlank()) directUrls.add(str)
+                    }
+                    is JsonArray -> {
+                        for (element in verURLObj) {
+                            when (element) {
+                                is JsonPrimitive -> {
+                                    val str = element.content.trim()
+                                    if (str.isNotBlank()) directUrls.add(str)
+                                }
+                                is JsonObject -> {
+                                    val epUrl = element.getFlexString("url", "link", "verURL", "verUrl")
+                                    if (!epUrl.isNullOrBlank()) {
+                                        val sNum = parseSeasonNumber(element.getFlexString("temporada", "season") ?: temporada)
+                                        val eNum = parseEpisodeNumber(element.getFlexString("capitulo", "episode"))
+                                        parsedEpisodes.add(ParsedEpisode(sNum, eNum, epUrl))
+                                    }
+                                }
+                                else -> {}
+                            }
+                        }
+                    }
+                    else -> {}
+                }
 
-    override suspend fun getMovie(id: String): Movie {
-        throw UnsupportedOperationException("SeriesFlix is a series-only provider")
-    }
-
-    override suspend fun getTvShow(id: String): TvShow {
-        val document = service.getPage(id)
-        val container = document.selectFirst("article.TPost.A") ?: document
-
-        val title = container.selectFirst("h1.Title")?.text()
-            ?.removePrefix("Serie ")
-            ?.trim()
-            .orEmpty()
-        val info = container.selectFirst(".Info")
-        val overview = container.selectFirst(".Description > p:not([class])")?.text()?.trim()
-        val banner = normalizeImageUrl(container.selectFirst(".Image img")?.attr("src"))
-        val genres = container.select(".Description .Genre a[href]").map { genreAnchor ->
-            Genre(
-                id = genreAnchor.attr("href").trim(),
-                name = genreAnchor.text().trim().trimEnd(',')
-            )
-        }
-        val directors = container.select(".Description .Director a").map { director ->
-            People(
-                id = director.text().trim(),
-                name = director.text().trim()
-            )
-        }
-        val cast = container.select(".Description .Cast a").map { actor ->
-            People(
-                id = actor.attr("href").trim(),
-                name = actor.text().trim().trimEnd(',')
-            )
-        }
-        val seasons = document.select("a[href*='/temporada/']").mapNotNull { seasonAnchor ->
-            val href = seasonAnchor.attr("href").trim()
-            val number = Regex("""Temporada\s+(\d+)""", RegexOption.IGNORE_CASE)
-                .find(seasonAnchor.text())
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.toIntOrNull()
-                ?: Regex("""-(\d+)/?$""").find(href)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                ?: return@mapNotNull null
-
-            Season(
-                id = href,
-                number = number,
-                title = "Temporada $number",
-                poster = banner
-            )
-        }.distinctBy { it.id }.sortedBy { it.number }
-
-        return TvShow(
-            id = id,
-            title = title,
-            overview = overview,
-            released = info?.selectFirst(".Date")?.text()?.trim(),
-            runtime = parseRuntimeMinutes(info?.selectFirst(".Time")?.text()),
-            poster = banner,
-            banner = banner,
-            genres = genres,
-            directors = directors,
-            cast = cast,
-            seasons = seasons
-        )
-    }
-
-    override suspend fun getEpisodesBySeason(seasonId: String): List<Episode> {
-        val document = service.getPage(seasonId)
-
-        return document.select("section.SeasonBx .TPTblCn tr").mapNotNull { row ->
-            val href = row.selectFirst(".MvTbTtl a[href]")?.attr("href")?.trim() ?: return@mapNotNull null
-            val number = row.selectFirst(".Num")?.text()?.trim()?.toIntOrNull() ?: return@mapNotNull null
-            Episode(
-                id = href,
-                number = number,
-                title = row.selectFirst(".MvTbTtl a[href]")?.text()?.trim(),
-                poster = normalizeImageUrl(row.selectFirst(".MvTbImg img")?.attr("data-src"))
-                    ?: normalizeImageUrl(row.selectFirst(".MvTbImg img")?.attr("src"))
-            )
-        }
-    }
-
-    override suspend fun getGenre(id: String, page: Int): Genre {
-        val pageUrl = when {
-            id.startsWith("http") && page <= 1 -> id
-            id.startsWith("http") -> "${id.trimEnd('/')}/page/$page/"
-            page <= 1 -> "$baseUrl/genero/${id.trim('/')}/"
-            else -> "$baseUrl/genero/${id.trim('/')}/page/$page/"
-        }
-
-        val document = service.getPage(pageUrl)
-        val shows = document.select("article.TPost.B").mapNotNull(::parseShowCard)
-        val name = document.selectFirst(".Top .Title, h1.Title, h1")
-            ?.text()
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?: id.substringAfterLast('/').trim('/').replace('-', ' ')
-                .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
-
-        return Genre(id = id, name = name, shows = shows)
-    }
-
-    override suspend fun getPeople(id: String, page: Int): People {
-        val url = if (page <= 1) {
-            id
-        } else {
-            "${id.trimEnd('/')}/page/$page/"
-        }
-        val document = service.getPage(url)
-        val name = URLDecoder.decode(id.substringAfterLast("/"), "UTF-8").replace('+', ' ')
-
-        return People(
-            id = id,
-            name = name,
-            filmography = document.select("article.TPost.B").mapNotNull(::parseShowCard)
-        )
-    }
-
-    override suspend fun getServers(id: String, videoType: Video.Type): List<Video.Server> {
-        val document = service.getPage(id)
-        val servers = mutableListOf<Video.Server>()
-
-        document.select(".optns-bx .drpdn").forEach { group ->
-            val languageLabel = normalizeLanguageLabel(
-                group.selectFirst("button.bstd")?.text().orEmpty()
-            )
-
-            group.select(".Button.sgty[data-url]").forEachIndexed { index, serverButton ->
-                val decodedUrl = decodeBase64Url(serverButton.attr("data-url")) ?: return@forEachIndexed
-                val playableUrl = unwrapPlayableUrl(decodedUrl)
-                val hostLabel = extractHostLabel(playableUrl)
-
-                servers.add(
-                    Video.Server(
-                        id = playableUrl,
-                        name = buildServerLabel(languageLabel, hostLabel, index + 1),
-                        src = playableUrl
-                    )
+                SeriesFavEntry(
+                    titulo = titulo,
+                    imgURL = imgURL,
+                    temporada = temporada,
+                    descripcion = descripcion,
+                    plataforma = plataforma,
+                    seccion = seccion,
+                    fecha = fecha,
+                    trailerURL = trailerURL,
+                    isMovie = isMovie,
+                    entrySeasonNum = entrySeasonNum,
+                    directUrls = directUrls,
+                    episodesList = parsedEpisodes
                 )
             }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun generateShowId(cleanTitle: String): String {
+        val digest = MessageDigest.getInstance("MD5")
+            .digest(cleanTitle.lowercase().trim().toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        return "seriesfav:$digest"
+    }
+
+    // Inspirado en SeriesFlix: Limpieza y desenvolvimiento de URLs
+    private fun unwrapUrl(rawUrl: String): String {
+        var clean = rawUrl.trim()
+        if (clean.startsWith("aHR0c")) { // Detección Base64
+            clean = runCatching {
+                String(Base64.decode(clean, Base64.DEFAULT)).trim()
+            }.getOrDefault(clean)
         }
 
-        return servers.distinctBy { it.id }
-    }
-
-    override suspend fun getVideo(server: Video.Server): Video {
-        return Extractor.extract(server.src, server)
-    }
-
-    private suspend fun getSearchGenres(): List<Genre> {
-        val document = service.getPage(baseUrl)
-        val menuGenres = document.select("li.menu-item-has-children")
-            .firstOrNull { it.ownText().contains("GÉNEROS", ignoreCase = true) || it.text().contains("GÉNEROS", ignoreCase = true) }
-            ?.select("a[href*='/genero/']")
-            .orEmpty()
-
-        return menuGenres.mapNotNull { anchor ->
-            val href = anchor.attr("href").trim()
-            val name = anchor.text().trim()
-            if (href.isBlank() || name.isBlank()) return@mapNotNull null
-            Genre(id = href, name = name)
-        }.distinctBy { it.id }
-    }
-
-    private fun parseTopItem(element: Element): TvShow? {
-        val anchor = element.selectFirst("a[href*='/serie/']") ?: return null
-        val title = element.selectFirst("h2.Title")?.text()?.trim() ?: return null
-        return TvShow(
-            id = anchor.attr("href").trim(),
-            title = title,
-            poster = normalizeImageUrl(element.selectFirst("img")?.attr("data-src"))
-                ?: normalizeImageUrl(element.selectFirst("img")?.attr("src"))
-        )
-    }
-
-    private fun parseShowCard(element: Element): TvShow? {
-        val anchor = element.selectFirst("a[href*='/serie/']") ?: return null
-        val title = element.selectFirst("h2.Title")?.text()?.trim() ?: return null
-        val overview = element.selectFirst(".Description")?.text()?.trim()
-        return TvShow(
-            id = anchor.attr("href").trim(),
-            title = title,
-            overview = overview,
-            released = element.selectFirst(".Year, .Date")?.text()?.trim()
-                ?: element.selectFirst("span.Date")?.text()?.trim(),
-            runtime = parseRuntimeMinutes(element.selectFirst(".Time")?.text()),
-            poster = normalizeImageUrl(element.selectFirst("img")?.attr("data-src"))
-                ?: normalizeImageUrl(element.selectFirst("img")?.attr("src"))
-        )
-    }
-
-    private fun parseEpisodeCard(element: Element): Episode? {
-        val anchor = element.selectFirst("a[href*='/episodio/']") ?: return null
-        val title = element.selectFirst("h2.Title")?.text()?.trim() ?: return null
-        val subtitle = element.selectFirst("h2.Title")?.attr("data-subtitle").orEmpty()
-        val number = Regex("""(\d+)x(\d+)""").find(subtitle)?.groupValues?.getOrNull(2)?.toIntOrNull() ?: 0
-        return Episode(
-            id = anchor.attr("href").trim(),
-            number = number,
-            title = title,
-            poster = normalizeImageUrl(element.selectFirst("img")?.attr("data-src"))
-                ?: normalizeImageUrl(element.selectFirst("img")?.attr("src"))
-        )
-    }
-
-    private fun decodeBase64Url(value: String): String? {
-        return runCatching {
-            String(Base64.decode(value.trim(), Base64.DEFAULT)).trim()
-        }.getOrNull()?.takeIf { it.startsWith("http") }
-    }
-
-    private fun unwrapPlayableUrl(value: String): String {
-        val httpUrl = value.toHttpUrlOrNull() ?: return value
-        httpUrl.queryParameter("url")?.let { encodedInner ->
-            return URLDecoder.decode(encodedInner, "UTF-8")
+        val httpUrl = clean.toHttpUrlOrNull() ?: return clean
+        httpUrl.queryParameter("url")?.let { inner ->
+            return runCatching { URLDecoder.decode(inner, "UTF-8") }.getOrDefault(clean)
         }
-        return value
+        return clean
     }
 
+    // Inspirado en SeriesFlix: Extracción limpia de nombres de servidor
     private fun extractHostLabel(value: String): String {
         return runCatching {
             val host = value.toHttpUrlOrNull()?.host.orEmpty()
                 .removePrefix("www.")
                 .substringBefore(".")
             when {
-                host.contains("voe", ignoreCase = true) -> "Voe"
-                host.contains("nupload", ignoreCase = true) -> "Nupload"
-                host.contains("waaw", ignoreCase = true) -> "Waaw"
-                host.contains("upstream", ignoreCase = true) -> "Upstream"
+                host.contains("hglink", ignoreCase = true) -> "HGLink"
+                host.contains("goodstream", ignoreCase = true) -> "Goodstream"
+                host.contains("dailymotion", ignoreCase = true) || host.contains("dai", ignoreCase = true) -> "Dailymotion"
+                host.contains("ok", ignoreCase = true) -> "Ok.ru"
+                host.contains("voe", ignoreCase = true) -> "VOE"
                 host.contains("streamtape", ignoreCase = true) -> "Streamtape"
-                host.isBlank() -> "Server"
+                host.contains("mega", ignoreCase = true) -> "MEGA"
+                host.isBlank() -> "Servidor"
                 else -> host.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
             }
-        }.getOrDefault("Server")
+        }.getOrDefault("Servidor")
     }
 
-    private fun normalizeLanguageLabel(raw: String): String {
-        val upper = raw.uppercase(Locale.ROOT)
-        return when {
-            "LATINO" in upper -> "Latino"
-            "CASTELLANO" in upper || "ESPANOL" in upper || "ESPAÑOL" in upper -> "Castellano"
-            "SUBTITULADO" in upper || "SUBTITLED" in upper -> "Subtitulado"
-            raw.isBlank() -> "Server"
-            else -> raw.trim().replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+    override suspend fun getHome(): List<Category> {
+        val entries = fetchCatalog()
+        if (entries.isEmpty()) return emptyList()
+
+        val categories = mutableListOf<Category>()
+
+        val movieEntries = entries.filter { it.isMovie }
+        if (movieEntries.isNotEmpty()) {
+            val moviesList = movieEntries.distinctBy { it.titulo.lowercase().trim() }.map { createMovieObject(it) }
+            categories.add(Category("Películas", moviesList))
+        }
+
+        val seriesEntries = entries.filter { !it.isMovie }
+        val groupedSeries = seriesEntries.groupBy { entry ->
+            entry.seccion?.takeIf { it.isNotBlank() && !it.lowercase().contains("peli") }
+                ?: entry.plataforma?.takeIf { it.isNotBlank() }
+                ?: "Catálogo Series"
+        }
+
+        for ((sectionName, sectionItems) in groupedSeries) {
+            val seriesList = groupEntriesToItems(sectionItems).filterIsInstance<TvShow>()
+            if (seriesList.isNotEmpty()) {
+                categories.add(Category(sectionName, seriesList))
+            }
+        }
+
+        return categories
+    }
+
+    private fun groupEntriesToItems(entries: List<SeriesFavEntry>): List<AppAdapter.Item> {
+        val movies = entries.filter { it.isMovie }.distinctBy { it.titulo.lowercase().trim() }.map { createMovieObject(it) }
+
+        val seriesGrouped = entries.filter { !it.isMovie }
+            .groupBy { it.titulo.lowercase().trim() }
+            .map { (_, sameTitleEntries) -> createTvShowObject(sameTitleEntries) }
+
+        return movies + seriesGrouped
+    }
+
+    private fun createMovieObject(entry: SeriesFavEntry): Movie {
+        return Movie(
+            id = generateShowId(entry.titulo),
+            title = entry.titulo,
+            overview = entry.descripcion,
+            released = entry.fecha?.takeIf { it.isNotBlank() },
+            trailer = entry.trailerURL,
+            poster = entry.imgURL,
+            banner = entry.imgURL
+        ).apply { providerName = name }
+    }
+
+    private fun createTvShowObject(sameTitleEntries: List<SeriesFavEntry>): TvShow {
+        val first = sameTitleEntries.first()
+        val showId = generateShowId(first.titulo)
+
+        val seasonNumbers = mutableSetOf<Int>()
+        for (entry in sameTitleEntries) {
+            if (entry.episodesList.isNotEmpty()) {
+                seasonNumbers.addAll(entry.episodesList.map { it.seasonNum })
+            } else {
+                seasonNumbers.add(entry.entrySeasonNum)
+            }
+        }
+
+        val seasons = seasonNumbers.sorted().map { sNum ->
+            Season(
+                id = "$showId:s$sNum",
+                number = sNum,
+                title = "Temporada $sNum"
+            )
+        }
+
+        return TvShow(
+            id = showId,
+            title = first.titulo,
+            overview = first.descripcion,
+            released = first.fecha?.takeIf { it.isNotBlank() },
+            trailer = first.trailerURL,
+            poster = first.imgURL,
+            banner = first.imgURL,
+            seasons = seasons
+        ).apply { providerName = name }
+    }
+
+    override suspend fun search(query: String, page: Int): List<AppAdapter.Item> {
+        if (page > 1) return emptyList()
+        val needle = query.trim().lowercase()
+        val filtered = fetchCatalog().filter {
+            it.titulo.lowercase().contains(needle) || it.descripcion?.lowercase()?.contains(needle) == true
+        }
+        return groupEntriesToItems(filtered)
+    }
+
+    override suspend fun getMovies(page: Int): List<Movie> {
+        if (page > 1) return emptyList()
+        return fetchCatalog().filter { it.isMovie }.distinctBy { it.titulo.lowercase().trim() }.map { createMovieObject(it) }
+    }
+
+    override suspend fun getTvShows(page: Int): List<TvShow> {
+        if (page > 1) return emptyList()
+        return fetchCatalog().filter { !it.isMovie }
+            .groupBy { it.titulo.lowercase().trim() }
+            .map { (_, list) -> createTvShowObject(list) }
+    }
+
+    override suspend fun getMovie(id: String): Movie {
+        val cleanId = id.substringBefore(":s").substringBefore(":ep")
+        val entry = fetchCatalog().firstOrNull { generateShowId(it.titulo) == cleanId }
+            ?: throw NoSuchElementException("Película no encontrada")
+        return createMovieObject(entry)
+    }
+
+    override suspend fun getTvShow(id: String): TvShow {
+        val cleanId = id.substringBefore(":s").substringBefore(":ep")
+        val entries = fetchCatalog().filter { generateShowId(it.titulo) == cleanId }
+        if (entries.isEmpty()) throw NoSuchElementException("Serie no encontrada")
+        return createTvShowObject(entries)
+    }
+
+    override suspend fun getEpisodesBySeason(seasonId: String): List<Episode> {
+        val cleanId = seasonId.substringBefore(":s").substringBefore(":ep")
+        val targetSeasonNum = seasonId.substringAfter(":s", "1").substringBefore(":ep").toIntOrNull() ?: 1
+
+        val entries = fetchCatalog().filter { generateShowId(it.titulo) == cleanId }
+        if (entries.isEmpty()) return emptyList()
+
+        val episodeList = mutableListOf<Episode>()
+
+        for (entry in entries) {
+            val matchingEps = entry.episodesList.filter { it.seasonNum == targetSeasonNum }
+            if (matchingEps.isNotEmpty()) {
+                for (ep in matchingEps) {
+                    episodeList.add(
+                        Episode(
+                            id = "$cleanId:s${targetSeasonNum}:ep${ep.episodeNum}",
+                            number = ep.episodeNum,
+                            title = "Capítulo ${ep.episodeNum}",
+                            overview = entry.descripcion,
+                            poster = entry.imgURL
+                        )
+                    )
+                }
+            } else if (entry.entrySeasonNum == targetSeasonNum && entry.directUrls.isNotEmpty()) {
+                episodeList.add(
+                    Episode(
+                        id = "$cleanId:s${targetSeasonNum}:ep1",
+                        number = 1,
+                        title = entry.titulo,
+                        overview = entry.descripcion,
+                        poster = entry.imgURL
+                    )
+                )
+            }
+        }
+
+        return episodeList.distinctBy { it.number }.sortedBy { it.number }
+    }
+
+    override suspend fun getGenre(id: String, page: Int): Genre {
+        throw UnsupportedOperationException("SeriesFav Catalog no soporta géneros")
+    }
+
+    override suspend fun getPeople(id: String, page: Int): People {
+        throw UnsupportedOperationException("SeriesFav Catalog no soporta personas")
+    }
+
+    override suspend fun getServers(id: String, videoType: Video.Type): List<Video.Server> {
+        val cleanId = id.substringBefore(":s").substringBefore(":ep")
+        val entries = fetchCatalog().filter { generateShowId(it.titulo) == cleanId }
+        if (entries.isEmpty()) return emptyList()
+
+        val rawUrls = mutableListOf<Pair<String, String?>>()
+
+        if (id.contains(":ep")) {
+            val targetSeasonNum = id.substringAfter(":s").substringBefore(":ep").toIntOrNull() ?: 1
+            val targetEpNum = id.substringAfter(":ep").toIntOrNull() ?: 1
+
+            for (entry in entries) {
+                val matchingEps = entry.episodesList.filter { it.seasonNum == targetSeasonNum && it.episodeNum == targetEpNum }
+                for (ep in matchingEps) {
+                    rawUrls.add(ep.url to entry.plataforma)
+                }
+
+                if (matchingEps.isEmpty() && entry.entrySeasonNum == targetSeasonNum) {
+                    for (url in entry.directUrls) {
+                        rawUrls.add(url to entry.plataforma)
+                    }
+                }
+            }
+        } else {
+            for (entry in entries) {
+                for (url in entry.directUrls) {
+                    rawUrls.add(url to entry.plataforma)
+                }
+            }
+        }
+
+        // Método idéntico a SeriesFlix: asignar src con la URL limpia e id de servidor formateado
+        return rawUrls.distinctBy { it.first }.mapIndexed { index, (url, platform) ->
+            val cleanUrl = unwrapUrl(url)
+            val hostLabel = extractHostLabel(cleanUrl)
+            val nameLabel = if (!platform.isNullOrBlank()) "$platform - $hostLabel ${index + 1}" else "$hostLabel ${index + 1}"
+
+            Video.Server(
+                id = cleanUrl,
+                name = nameLabel,
+                src = cleanUrl
+            )
         }
     }
 
-    private fun buildServerLabel(languageLabel: String, hostLabel: String, optionNumber: Int): String {
-        return listOf(languageLabel, "$hostLabel $optionNumber")
-            .filter { it.isNotBlank() }
-            .joinToString(" - ")
-    }
-
-    private fun normalizeImageUrl(url: String?): String? {
-        val clean = url?.trim().orEmpty()
-        if (clean.isBlank()) return null
-        return when {
-            clean.startsWith("//") -> "https:$clean"
-            clean.startsWith("/") -> "$baseUrl$clean"
-            else -> clean
-        }
-    }
-
-    private fun parseRuntimeMinutes(value: String?): Int? {
-        val raw = value?.trim().orEmpty()
-        if (raw.isBlank()) return null
-
-        val hourMatch = Regex("""(\d+)\s*h""", RegexOption.IGNORE_CASE).find(raw)
-        val minuteMatch = Regex("""(\d+)\s*min""", RegexOption.IGNORE_CASE).find(raw)
-        val hours = hourMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-        val minutes = minuteMatch?.groupValues?.getOrNull(1)?.toIntOrNull()
-            ?: raw.filter { it.isDigit() }.toIntOrNull()
-
-        return when {
-            hours > 0 -> hours * 60 + (minuteMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0)
-            minutes != null -> minutes
-            else -> null
-        }
+    // Utiliza el motor nativo de extractores de Streamflix
+    override suspend fun getVideo(server: Video.Server): Video {
+        return runCatching {
+            Extractor.extract(server.src, server)
+        }.getOrDefault(
+            Video(source = server.src)
+        )
     }
 }
