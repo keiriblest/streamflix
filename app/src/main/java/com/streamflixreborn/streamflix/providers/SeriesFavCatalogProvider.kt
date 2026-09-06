@@ -6,7 +6,6 @@ import com.streamflixreborn.streamflix.models.Episode
 import com.streamflixreborn.streamflix.models.Genre
 import com.streamflixreborn.streamflix.models.Movie
 import com.streamflixreborn.streamflix.models.People
-import com.streamflixreborn.streamflix.models.Season
 import com.streamflixreborn.streamflix.models.TvShow
 import com.streamflixreborn.streamflix.models.Video
 import com.streamflixreborn.streamflix.utils.DnsResolver
@@ -17,9 +16,6 @@ import okhttp3.Request
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
-/**
- * SeriesFav Provider (Con soporte completo de reproducción)
- */
 object SeriesFavCatalogProvider : Provider {
 
     override val name = "SeriesFav Catalog"
@@ -41,7 +37,7 @@ object SeriesFavCatalogProvider : Provider {
         val seccion: String? = null,
         val fecha: String? = null,
         val trailerURL: String? = null,
-        val verURL: String? = null // ✅ Declarado para incluir las URLs de reproducción
+        val verURL: String? = null // ✅ Se incluye la propiedad para leer las URLs de reproducción
     )
 
     private val json = Json {
@@ -98,27 +94,14 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     private fun SeriesFavEntry.toTvShow(): TvShow {
-        val showId = toId()
-        // Creamos una temporada por defecto basada en los datos
-        val seasonNumber = temporada?.filter { it.isDigit() }?.toIntOrNull() ?: 1
-        
-        val seasonsList = listOf(
-            Season(
-                id = "$showId:s$seasonNumber",
-                number = seasonNumber,
-                title = temporada ?: "Temporada $seasonNumber"
-            )
-        )
-
         return TvShow(
-            id = showId,
+            id = toId(),
             title = titulo,
             overview = descripcion,
             released = fecha?.takeIf { it.isNotBlank() },
             trailer = trailerURL,
             poster = imgURL,
             banner = imgURL,
-            seasons = seasonsList
         ).apply {
             providerName = name
         }
@@ -164,49 +147,41 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     override suspend fun getMovie(id: String): Movie {
-        throw UnsupportedOperationException("SeriesFav Catalog solo ofrece series")
+        throw UnsupportedOperationException("SeriesFav Catalog only provides TV shows")
     }
 
     override suspend fun getTvShow(id: String): TvShow {
         val entry = fetchCatalog().firstOrNull { it.toId() == id }
-            ?: throw NoSuchElementException("SeriesFav Catalog: Serie no encontrada")
+            ?: throw NoSuchElementException("SeriesFav Catalog: show not found")
         return entry.toTvShow()
     }
 
     override suspend fun getEpisodesBySeason(seasonId: String): List<Episode> {
-        val showId = seasonId.substringBefore(":s")
-        val entry = fetchCatalog().firstOrNull { it.toId() == showId } ?: return emptyList()
-        
-        // Si no existe verURL, no hay enlaces de reproducción
+        val entry = fetchCatalog().firstOrNull { it.toId() == seasonId } ?: return emptyList()
         val url = entry.verURL?.takeIf { it.isNotBlank() } ?: return emptyList()
 
-        // Genera el episodio principal utilizando verURL como identificador del servidor
         return listOf(
             Episode(
-                id = "$seasonId:ep1",
+                id = seasonId,
                 number = 1,
-                title = "${entry.titulo} - Ver en línea",
+                title = entry.titulo,
                 poster = entry.imgURL
             )
         )
     }
 
     override suspend fun getGenre(id: String, page: Int): Genre {
-        throw UnsupportedOperationException("SeriesFav Catalog no soporta géneros")
+        throw UnsupportedOperationException("SeriesFav Catalog does not support genres")
     }
 
     override suspend fun getPeople(id: String, page: Int): People {
-        throw UnsupportedOperationException("SeriesFav Catalog no soporta personas")
+        throw UnsupportedOperationException("SeriesFav Catalog does not support people")
     }
 
     override suspend fun getServers(id: String, videoType: Video.Type): List<Video.Server> {
-        // Obtenemos la serie por su ID
-        val showId = id.substringBefore(":s")
-        val entry = fetchCatalog().firstOrNull { it.toId() == showId } ?: return emptyList()
-
+        val entry = fetchCatalog().firstOrNull { it.toId() == id } ?: return emptyList()
         val playbackUrl = entry.verURL?.takeIf { it.isNotBlank() } ?: return emptyList()
 
-        // Devolvemos el servidor de vídeo con la URL encontrada
         return listOf(
             Video.Server(
                 id = playbackUrl,
@@ -216,7 +191,6 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     override suspend fun getVideo(server: Video.Server): Video {
-        // Devuelve el objeto Video listo para reproducir desde verURL
         return Video(
             url = server.id,
             quality = Video.Quality.QUALITY_1080P
