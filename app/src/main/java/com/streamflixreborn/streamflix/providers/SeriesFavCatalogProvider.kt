@@ -1,6 +1,8 @@
 package com.streamflixreborn.streamflix.providers
 
+import android.util.Base64
 import com.streamflixreborn.streamflix.adapters.AppAdapter
+import com.streamflixreborn.streamflix.extractors.Extractor
 import com.streamflixreborn.streamflix.models.Category
 import com.streamflixreborn.streamflix.models.Episode
 import com.streamflixreborn.streamflix.models.Genre
@@ -15,12 +17,12 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.net.URLDecoder
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 object SeriesFavCatalogProvider : Provider {
@@ -218,19 +220,40 @@ object SeriesFavCatalogProvider : Provider {
         return "seriesfav:$digest"
     }
 
-    private fun getProviderNameFromUrl(url: String, defaultName: String?): String {
-        val lower = url.lowercase()
-        return when {
-            lower.contains("hglink") -> "HGLink"
-            lower.contains("goodstream") -> "Goodstream"
-            lower.contains("dailymotion") || lower.contains("dai.ly") -> "Dailymotion"
-            lower.contains("ok.ru") -> "Ok.ru"
-            lower.contains("streamtape") -> "Streamtape"
-            lower.contains("voe") -> "VOE"
-            lower.contains("mega") -> "MEGA"
-            !defaultName.isNullOrBlank() -> defaultName
-            else -> "Servidor Principal"
+    // Inspirado en SeriesFlix: Limpieza y desenvolvimiento de URLs
+    private fun unwrapUrl(rawUrl: String): String {
+        var clean = rawUrl.trim()
+        if (clean.startsWith("aHR0c")) { // Detección Base64
+            clean = runCatching {
+                String(Base64.decode(clean, Base64.DEFAULT)).trim()
+            }.getOrDefault(clean)
         }
+
+        val httpUrl = clean.toHttpUrlOrNull() ?: return clean
+        httpUrl.queryParameter("url")?.let { inner ->
+            return runCatching { URLDecoder.decode(inner, "UTF-8") }.getOrDefault(clean)
+        }
+        return clean
+    }
+
+    // Inspirado en SeriesFlix: Extracción limpia de nombres de servidor
+    private fun extractHostLabel(value: String): String {
+        return runCatching {
+            val host = value.toHttpUrlOrNull()?.host.orEmpty()
+                .removePrefix("www.")
+                .substringBefore(".")
+            when {
+                host.contains("hglink", ignoreCase = true) -> "HGLink"
+                host.contains("goodstream", ignoreCase = true) -> "Goodstream"
+                host.contains("dailymotion", ignoreCase = true) || host.contains("dai", ignoreCase = true) -> "Dailymotion"
+                host.contains("ok", ignoreCase = true) -> "Ok.ru"
+                host.contains("voe", ignoreCase = true) -> "VOE"
+                host.contains("streamtape", ignoreCase = true) -> "Streamtape"
+                host.contains("mega", ignoreCase = true) -> "MEGA"
+                host.isBlank() -> "Servidor"
+                else -> host.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+            }
+        }.getOrDefault("Servidor")
     }
 
     override suspend fun getHome(): List<Category> {
@@ -404,7 +427,7 @@ object SeriesFavCatalogProvider : Provider {
         val entries = fetchCatalog().filter { generateShowId(it.titulo) == cleanId }
         if (entries.isEmpty()) return emptyList()
 
-        val servers = mutableListOf<Video.Server>()
+        val rawUrls = mutableListOf<Pair<String, String?>>()
 
         if (id.contains(":ep")) {
             val targetSeasonNum = id.substringAfter(":s").substringBefore(":ep").toIntOrNull() ?: 1
@@ -413,130 +436,43 @@ object SeriesFavCatalogProvider : Provider {
             for (entry in entries) {
                 val matchingEps = entry.episodesList.filter { it.seasonNum == targetSeasonNum && it.episodeNum == targetEpNum }
                 for (ep in matchingEps) {
-                    servers.add(
-                        Video.Server(
-                            id = ep.url,
-                            name = getProviderNameFromUrl(ep.url, entry.plataforma)
-                        )
-                    )
+                    rawUrls.add(ep.url to entry.plataforma)
                 }
 
                 if (matchingEps.isEmpty() && entry.entrySeasonNum == targetSeasonNum) {
                     for (url in entry.directUrls) {
-                        servers.add(
-                            Video.Server(
-                                id = url,
-                                name = getProviderNameFromUrl(url, entry.plataforma)
-                            )
-                        )
+                        rawUrls.add(url to entry.plataforma)
                     }
                 }
             }
         } else {
             for (entry in entries) {
                 for (url in entry.directUrls) {
-                    servers.add(
-                        Video.Server(
-                            id = url,
-                            name = getProviderNameFromUrl(url, entry.plataforma)
-                        )
-                    )
+                    rawUrls.add(url to entry.plataforma)
                 }
             }
         }
 
-        return servers.distinctBy { it.id }
+        // Método idéntico a SeriesFlix: asignar src con la URL limpia e id de servidor formateado
+        return rawUrls.distinctBy { it.first }.mapIndexed { index, (url, platform) ->
+            val cleanUrl = unwrapUrl(url)
+            val hostLabel = extractHostLabel(cleanUrl)
+            val nameLabel = if (!platform.isNullOrBlank()) "$platform - $hostLabel ${index + 1}" else "$hostLabel ${index + 1}"
+
+            Video.Server(
+                id = cleanUrl,
+                name = nameLabel,
+                src = cleanUrl
+            )
+        }
     }
 
-    /**
-     * Resuelve los enlaces de hglink.to, goodstream.one y Dailymotion a transmisiones .m3u8/.mp4
-     */
-    private fun resolveStreamUrl(url: String): String {
-        val cleanUrl = url.trim()
-        if (cleanUrl.isBlank()) return url
-
-        if (cleanUrl.endsWith(".m3u8") || cleanUrl.endsWith(".mp4") || cleanUrl.endsWith(".mkv")) {
-            return cleanUrl
-        }
-
-        // Extractor Dailymotion
-        if (cleanUrl.contains("dailymotion.com") || cleanUrl.contains("dai.ly")) {
-            val videoId = when {
-                cleanUrl.contains("/embed/video/") -> cleanUrl.substringAfter("/embed/video/").substringBefore("?").substringBefore("/")
-                cleanUrl.contains("/video/") -> cleanUrl.substringAfter("/video/").substringBefore("?").substringBefore("/")
-                cleanUrl.contains("dai.ly/") -> cleanUrl.substringAfter("dai.ly/").substringBefore("?")
-                else -> ""
-            }
-
-            if (videoId.isNotBlank()) {
-                val direct = runCatching {
-                    val metaUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
-                    val request = Request.Builder().url(metaUrl).get().build()
-                    val responseBody = client.newCall(request).execute().use { res ->
-                        if (res.isSuccessful) res.body?.string() else null
-                    }
-
-                    if (!responseBody.isNullOrBlank()) {
-                        val jsonElem = Json.parseToJsonElement(responseBody)
-                        val qualities = jsonElem.jsonObject["qualities"]?.jsonObject
-                        val autoArray = qualities?.get("auto")?.jsonArray
-                        for (item in autoArray.orEmpty()) {
-                            val m3u8Url = item.jsonObject["url"]?.jsonPrimitive?.content
-                            if (!m3u8Url.isNullOrBlank()) {
-                                return@runCatching m3u8Url
-                            }
-                        }
-                    }
-                    null
-                }.getOrNull()
-
-                if (!direct.isNullOrBlank()) return direct
-            }
-        }
-
-        // Extractor genérico para hglink.to, goodstream.one y similares
-        return runCatching {
-            val requestBuilder = Request.Builder()
-                .url(cleanUrl)
-                .header("User-Agent", USER_AGENT)
-
-            when {
-                cleanUrl.contains("hglink.to") -> requestBuilder.header("Referer", "https://hglink.to/")
-                cleanUrl.contains("goodstream.one") -> requestBuilder.header("Referer", "https://goodstream.one/")
-                else -> requestBuilder.header("Referer", cleanUrl)
-            }
-
-            val html = client.newCall(requestBuilder.build()).execute().use { res ->
-                if (res.isSuccessful) res.body?.string() else null
-            }
-
-            if (!html.isNullOrBlank()) {
-                // Extracción de file: "https://..." típico en JWPlayer o HTML5 players
-                val jsFileRegex = Regex("""file\s*:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""")
-                val jsMatch = jsFileRegex.find(html)?.groupValues?.get(1)
-                if (!jsMatch.isNullOrBlank()) return@runCatching jsMatch
-
-                // Extracción de fuentes m3u8 generales
-                val m3u8Regex = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""")
-                val m3u8Match = m3u8Regex.find(html)?.value
-                if (!m3u8Match.isNullOrBlank()) return@runCatching m3u8Match
-
-                // Extracción de fuentes mp4 generales
-                val mp4Regex = Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""")
-                val mp4Match = mp4Regex.find(html)?.value
-                if (!mp4Match.isNullOrBlank()) return@runCatching mp4Match
-            }
-
-            cleanUrl
-        }.getOrDefault(cleanUrl)
-    }
-
+    // Utiliza el motor nativo de extractores de Streamflix
     override suspend fun getVideo(server: Video.Server): Video {
-        val resolvedUrl = withContext(Dispatchers.IO) {
-            resolveStreamUrl(server.id)
-        }
-        return Video(
-            source = resolvedUrl
+        return runCatching {
+            Extractor.extract(server.src, server)
+        }.getOrDefault(
+            Video(source = server.src)
         )
     }
 }
