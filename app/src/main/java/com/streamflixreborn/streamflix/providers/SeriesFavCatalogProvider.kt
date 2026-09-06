@@ -37,7 +37,7 @@ object SeriesFavCatalogProvider : Provider {
         val seccion: String? = null,
         val fecha: String? = null,
         val trailerURL: String? = null,
-        val verURL: String? = null // ✅ Se incluye la propiedad para leer las URLs de reproducción
+        val verURL: String? = null // Incluido para recuperar las URLs de reproducción
     )
 
     private val json = Json {
@@ -191,9 +191,9 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     override suspend fun getVideo(server: Video.Server): Video {
+        // Corrección de los parámetros solicitados por el compilador
         return Video(
-            url = server.id,
-            quality = Video.Quality.QUALITY_1080P
+            source = server.id
         )
     }
 }
