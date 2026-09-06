@@ -15,6 +15,9 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.security.MessageDigest
@@ -48,7 +51,7 @@ object SeriesFavCatalogProvider : Provider {
         val trailerURL: String?,
         val isMovie: Boolean,
         val entrySeasonNum: Int,
-        val directUrl: String?,
+        val directUrls: List<String>,
         val episodesList: List<ParsedEpisode>
     )
 
@@ -95,9 +98,6 @@ object SeriesFavCatalogProvider : Provider {
         }
     }
 
-    /**
-     * Réplica exacta de la función esPelicula(item) de desktop.html
-     */
     private fun isMovieCheck(tipo: String?, seccion: String?, plataforma: String?, temporada: String?): Boolean {
         val t = tipo?.lowercase().orEmpty()
         val s = seccion?.lowercase().orEmpty()
@@ -162,19 +162,21 @@ object SeriesFavCatalogProvider : Provider {
                 val isMovie = isMovieCheck(tipo, seccion, plataforma, temporada)
                 val entrySeasonNum = parseSeasonNumber(temporada)
 
-                var directUrl: String? = null
+                val directUrls = mutableListOf<String>()
                 val parsedEpisodes = mutableListOf<ParsedEpisode>()
 
                 val verURLObj = item["verURL"] ?: item["verUrl"] ?: item["url"] ?: item["streamUrl"]
                 when (verURLObj) {
                     is JsonPrimitive -> {
-                        directUrl = verURLObj.content.trim().takeIf { it.isNotBlank() }
+                        val str = verURLObj.content.trim()
+                        if (str.isNotBlank()) directUrls.add(str)
                     }
                     is JsonArray -> {
                         for (element in verURLObj) {
                             when (element) {
                                 is JsonPrimitive -> {
-                                    if (directUrl == null) directUrl = element.content.trim()
+                                    val str = element.content.trim()
+                                    if (str.isNotBlank()) directUrls.add(str)
                                 }
                                 is JsonObject -> {
                                     val epUrl = element.getFlexString("url", "link", "verURL", "verUrl")
@@ -202,7 +204,7 @@ object SeriesFavCatalogProvider : Provider {
                     trailerURL = trailerURL,
                     isMovie = isMovie,
                     entrySeasonNum = entrySeasonNum,
-                    directUrl = directUrl,
+                    directUrls = directUrls,
                     episodesList = parsedEpisodes
                 )
             }
@@ -216,29 +218,53 @@ object SeriesFavCatalogProvider : Provider {
         return "seriesfav:$digest"
     }
 
+    private fun getProviderNameFromUrl(url: String, defaultName: String?): String {
+        val lower = url.lowercase()
+        return when {
+            lower.contains("dailymotion") || lower.contains("dai.ly") -> "Dailymotion"
+            lower.contains("ok.ru") || lower.contains("odnoklassniki") -> "Ok.ru"
+            lower.contains("streamtape") -> "Streamtape"
+            lower.contains("voe.sx") || lower.contains("voe.inc") -> "VOE"
+            lower.contains("mega.nz") || lower.contains("mega.co") -> "MEGA"
+            lower.contains("fembed") || lower.contains("feurl") -> "Fembed"
+            lower.contains("mixdrop") -> "Mixdrop"
+            lower.contains("dood") -> "Doodstream"
+            !defaultName.isNullOrBlank() -> defaultName
+            else -> "Servidor Principal"
+        }
+    }
+
     override suspend fun getHome(): List<Category> {
         val entries = fetchCatalog()
         if (entries.isEmpty()) return emptyList()
 
-        val grouped = entries.groupBy { entry ->
-            entry.seccion?.takeIf { it.isNotBlank() }
+        val categories = mutableListOf<Category>()
+
+        val movieEntries = entries.filter { it.isMovie }
+            if (movieEntries.isNotEmpty()) {
+                val moviesList = movieEntries.distinctBy { it.titulo.lowercase().trim() }.map { createMovieObject(it) }
+                categories.add(Category("Películas", moviesList))
+            }
+
+        val seriesEntries = entries.filter { !it.isMovie }
+        val groupedSeries = seriesEntries.groupBy { entry ->
+            entry.seccion?.takeIf { it.isNotBlank() && !it.lowercase().contains("peli") }
                 ?: entry.plataforma?.takeIf { it.isNotBlank() }
-                ?: "Catálogo SeriesFav"
+                ?: "Catálogo Series"
         }
 
-        return grouped.map { (sectionName, sectionEntries) ->
-            Category(
-                name = sectionName,
-                list = groupEntriesToItems(sectionEntries)
-            )
+        for ((sectionName, sectionItems) in groupedSeries) {
+            val seriesList = groupEntriesToItems(sectionItems).filterIsInstance<TvShow>()
+            if (seriesList.isNotEmpty()) {
+                categories.add(Category(sectionName, seriesList))
+            }
         }
+
+        return categories
     }
 
-    /**
-     * Agrupa entradas por título para consolidar temporadas y evitar fichas duplicadas
-     */
     private fun groupEntriesToItems(entries: List<SeriesFavEntry>): List<AppAdapter.Item> {
-        val movies = entries.filter { it.isMovie }.map { createMovieObject(it) }
+        val movies = entries.filter { it.isMovie }.distinctBy { it.titulo.lowercase().trim() }.map { createMovieObject(it) }
 
         val seriesGrouped = entries.filter { !it.isMovie }
             .groupBy { it.titulo.lowercase().trim() }
@@ -303,7 +329,7 @@ object SeriesFavCatalogProvider : Provider {
 
     override suspend fun getMovies(page: Int): List<Movie> {
         if (page > 1) return emptyList()
-        return fetchCatalog().filter { it.isMovie }.map { createMovieObject(it) }
+        return fetchCatalog().filter { it.isMovie }.distinctBy { it.titulo.lowercase().trim() }.map { createMovieObject(it) }
     }
 
     override suspend fun getTvShows(page: Int): List<TvShow> {
@@ -350,7 +376,7 @@ object SeriesFavCatalogProvider : Provider {
                         )
                     )
                 }
-            } else if (entry.entrySeasonNum == targetSeasonNum && !entry.directUrl.isNullOrBlank()) {
+            } else if (entry.entrySeasonNum == targetSeasonNum && entry.directUrls.isNotEmpty()) {
                 episodeList.add(
                     Episode(
                         id = "$cleanId:s${targetSeasonNum}:ep1",
@@ -379,46 +405,132 @@ object SeriesFavCatalogProvider : Provider {
         val entries = fetchCatalog().filter { generateShowId(it.titulo) == cleanId }
         if (entries.isEmpty()) return emptyList()
 
+        val servers = mutableListOf<Video.Server>()
+
         if (id.contains(":ep")) {
             val targetSeasonNum = id.substringAfter(":s").substringBefore(":ep").toIntOrNull() ?: 1
             val targetEpNum = id.substringAfter(":ep").toIntOrNull() ?: 1
 
             for (entry in entries) {
-                val epMatch = entry.episodesList.firstOrNull { it.seasonNum == targetSeasonNum && it.episodeNum == targetEpNum }
-                if (epMatch != null) {
-                    return listOf(
+                val matchingEps = entry.episodesList.filter { it.seasonNum == targetSeasonNum && it.episodeNum == targetEpNum }
+                for (ep in matchingEps) {
+                    servers.add(
                         Video.Server(
-                            id = epMatch.url,
-                            name = entry.plataforma?.takeIf { it.isNotBlank() } ?: "Servidor Principal"
+                            id = ep.url,
+                            name = getProviderNameFromUrl(ep.url, entry.plataforma)
                         )
                     )
-                } else if (entry.entrySeasonNum == targetSeasonNum && !entry.directUrl.isNullOrBlank()) {
-                    return listOf(
+                }
+
+                if (matchingEps.isEmpty() && entry.entrySeasonNum == targetSeasonNum) {
+                    for (url in entry.directUrls) {
+                        servers.add(
+                            Video.Server(
+                                id = url,
+                                name = getProviderNameFromUrl(url, entry.plataforma)
+                            )
+                        )
+                    }
+                }
+            }
+        } else {
+            for (entry in entries) {
+                for (url in entry.directUrls) {
+                    servers.add(
                         Video.Server(
-                            id = entry.directUrl,
-                            name = entry.plataforma?.takeIf { it.isNotBlank() } ?: "Servidor Principal"
+                            id = url,
+                            name = getProviderNameFromUrl(url, entry.plataforma)
                         )
                     )
                 }
             }
-        } else {
-            val movieEntry = entries.firstOrNull { !it.directUrl.isNullOrBlank() }
-            if (movieEntry != null && movieEntry.directUrl != null) {
-                return listOf(
-                    Video.Server(
-                        id = movieEntry.directUrl,
-                        name = movieEntry.plataforma?.takeIf { it.isNotBlank() } ?: "Servidor Principal"
-                    )
-                )
+        }
+
+        return servers.distinctBy { it.id }
+    }
+
+    /**
+     * Extractor genérico de flujos de video (.m3u8 / .mp4) para Dailymotion, Ok.ru y servidores Embed.
+     */
+    private fun resolveStreamUrl(url: String): String {
+        val cleanUrl = url.trim()
+        if (cleanUrl.isBlank()) return url
+
+        // 1. Si es un enlace directo de vídeo, devolverlo inmediatamente
+        if (cleanUrl.endsWith(".m3u8") || cleanUrl.endsWith(".mp4") || cleanUrl.endsWith(".mkv")) {
+            return cleanUrl
+        }
+
+        // 2. Extractor específico para Dailymotion
+        if (cleanUrl.contains("dailymotion.com") || cleanUrl.contains("dai.ly")) {
+            val videoId = when {
+                cleanUrl.contains("/embed/video/") -> cleanUrl.substringAfter("/embed/video/").substringBefore("?").substringBefore("/")
+                cleanUrl.contains("/video/") -> cleanUrl.substringAfter("/video/").substringBefore("?").substringBefore("/")
+                cleanUrl.contains("dai.ly/") -> cleanUrl.substringAfter("dai.ly/").substringBefore("?")
+                else -> ""
+            }
+
+            if (videoId.isNotBlank()) {
+                val direct = runCatching {
+                    val metaUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
+                    val request = Request.Builder().url(metaUrl).get().build()
+                    val responseBody = client.newCall(request).execute().use { res ->
+                        if (res.isSuccessful) res.body?.string() else null
+                    }
+
+                    if (!responseBody.isNullOrBlank()) {
+                        val jsonElem = Json.parseToJsonElement(responseBody)
+                        val qualities = jsonElem.jsonObject["qualities"]?.jsonObject
+                        val autoArray = qualities?.get("auto")?.jsonArray
+                        for (item in autoArray.orEmpty()) {
+                            val m3u8Url = item.jsonObject["url"]?.jsonPrimitive?.content
+                            if (!m3u8Url.isNullOrBlank()) {
+                                return@runCatching m3u8Url
+                            }
+                        }
+                    }
+                    null
+                }.getOrNull()
+
+                if (!direct.isNullOrBlank()) return direct
             }
         }
 
-        return emptyList()
+        // 3. Extractor genérico (Scrapea el HTML del reproductor buscando flujos .m3u8 o .mp4)
+        return runCatching {
+            val request = Request.Builder()
+                .url(cleanUrl)
+                .header("User-Agent", USER_AGENT)
+                .header("Referer", cleanUrl)
+                .get()
+                .build()
+
+            val html = client.newCall(request).execute().use { res ->
+                if (res.isSuccessful) res.body?.string() else null
+            }
+
+            if (!html.isNullOrBlank()) {
+                // Busca URLs .m3u8 ocultas en la estructura del reproductor HTML
+                val m3u8Regex = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""")
+                val m3u8Match = m3u8Regex.find(html)?.value
+                if (!m3u8Match.isNullOrBlank()) return@runCatching m3u8Match
+
+                // Busca URLs .mp4 directas en la estructura del reproductor HTML
+                val mp4Regex = Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""")
+                val mp4Match = mp4Regex.find(html)?.value
+                if (!mp4Match.isNullOrBlank()) return@runCatching mp4Match
+            }
+
+            cleanUrl
+        }.getOrDefault(cleanUrl)
     }
 
     override suspend fun getVideo(server: Video.Server): Video {
+        val resolvedUrl = withContext(Dispatchers.IO) {
+            resolveStreamUrl(server.id)
+        }
         return Video(
-            source = server.id
+            source = resolvedUrl
         )
     }
 }
