@@ -29,6 +29,40 @@ import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
+/**
+ * Desempaquetador de scripts JS obuscados tipo Dean Edwards (eval(function(p,a,c,k,e,d)...))
+ */
+object JsUnpacker {
+    private val PACKED_REGEX = Regex(
+        """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('([^']*)',(\d+),(\d+),'([^']*)'\.split\('\|'\)""",
+        RegexOption.DOT_MATCHES_ALL
+    )
+
+    fun unpack(script: String): String {
+        val match = PACKED_REGEX.find(script) ?: return script
+        val (p, aStr, cStr, kStr) = match.destructured
+        var payload = p
+        val a = aStr.toIntOrNull() ?: 10
+        val c = cStr.toIntOrNull() ?: 0
+        val k = kStr.split("|")
+
+        fun getNth(n: Int): String {
+            val prefix = if (n >= a) getNth(n / a) else ""
+            val remainder = n % a
+            val char = if (remainder > 35) (remainder + 29).toChar() else remainder.toString(36)
+            return prefix + char
+        }
+
+        var count = c
+        while (count > 0) {
+            count--
+            val word = if (count < k.size && k[count].isNotEmpty()) k[count] else getNth(count)
+            payload = payload.replace(Regex("\\b${getNth(count)}\\b"), word)
+        }
+        return payload
+    }
+}
+
 object SeriesFavCatalogProvider : Provider {
 
     override val name = "SeriesFav Catalog"
@@ -65,6 +99,8 @@ object SeriesFavCatalogProvider : Provider {
         OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
             .addInterceptor { chain ->
                 chain.proceed(
                     chain.request().newBuilder()
@@ -95,11 +131,9 @@ object SeriesFavCatalogProvider : Provider {
             if (body.isNullOrBlank()) return@withContext emptyList()
 
             val entries = parseJsonToEntries(body)
-
             if (entries.isNotEmpty()) {
                 cache = entries
             }
-
             entries
         }
     }
@@ -196,7 +230,6 @@ object SeriesFavCatalogProvider : Provider {
                     else -> {}
                 }
 
-                // Regla solicitada: Si tiene plataforma o enlace pero no tiene temporadas ni episodios, es Película
                 val isExplicitMovie = isMovieCheck(tipo, seccion, plataforma, temporada)
                 val isImplicitMovie = parsedEpisodes.isEmpty() && directUrls.isNotEmpty() && (temporada.isNullOrBlank() || temporada.lowercase() == "null")
                 val isMovie = isExplicitMovie || isImplicitMovie
@@ -330,7 +363,6 @@ object SeriesFavCatalogProvider : Provider {
             }
         }
 
-        // Asignación de la imagen correspondiente a cada temporada específica del Gist
         val seasons = seasonNumbers.sorted().map { sNum ->
             val matchingEntry = sameTitleEntries.firstOrNull { 
                 it.entrySeasonNum == sNum || it.episodesList.any { ep -> ep.seasonNum == sNum } 
@@ -484,21 +516,21 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     /**
-     * Resolutor multitarget optimizado para Google Drive, Ok.ru, Sendvid, Voe, Goodstream, Minochinos, etc.
+     * Resolutor multitarget con Desempaquetador JS e inspección profunda de HTML/Iframes
      */
-    private fun resolveCustomStreamUrl(url: String): String {
-        val cleanUrl = url.trim()
-        if (cleanUrl.isBlank()) return url
+    private suspend fun resolveCustomStreamUrl(targetUrl: String): String = withContext(Dispatchers.IO) {
+        val cleanUrl = targetUrl.trim()
+        if (cleanUrl.isBlank()) return@withContext targetUrl
 
-        // 1. Google Drive Direct Converter
+        // 1. Google Drive
         if (cleanUrl.contains("drive.google.com")) {
             val fileId = Regex("""/file/d/([a-zA-Z0-9_-]+)""").find(cleanUrl)?.groupValues?.get(1)
             if (!fileId.isNullOrBlank()) {
-                return "https://drive.google.com/uc?export=download&id=$fileId"
+                return@withContext "https://drive.google.com/uc?export=download&id=$fileId"
             }
         }
 
-        // 2. Ok.ru JSON Metadata Extractor
+        // 2. Ok.ru (Procesamiento API + Extracción JSON)
         if (cleanUrl.contains("ok.ru")) {
             val videoId = cleanUrl.substringAfter("videoembed/").substringAfter("video/").substringBefore("?").substringBefore("/")
             if (videoId.isNotBlank() && videoId.all { it.isDigit() }) {
@@ -510,44 +542,61 @@ object SeriesFavCatalogProvider : Provider {
                         val jsonElem = Json.parseToJsonElement(resp)
                         val videos = jsonElem.jsonObject["videos"]?.jsonArray
                         val highestVideo = videos?.lastOrNull()?.jsonObject?.get("url")?.jsonPrimitive?.content
-                        if (!highestVideo.isNullOrBlank()) return highestVideo
+                        if (!highestVideo.isNullOrBlank()) return@withContext highestVideo
                     }
                 }
             }
         }
 
-        // 3. Sendvid Direct Video Extraction
-        if (cleanUrl.contains("sendvid.com")) {
-            runCatching {
-                val req = Request.Builder().url(cleanUrl).header("User-Agent", USER_AGENT).get().build()
-                val html = client.newCall(req).execute().use { it.body?.string().orEmpty() }
-                val srcMatch = Regex("""<source[^>]+src=["']([^"']+)["']""").find(html)?.groupValues?.get(1)
-                    ?: Regex("""var\s+video_url\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
-                if (!srcMatch.isNullOrBlank()) return srcMatch
-            }
-        }
-
-        // 4. Extractor HTML genérico (Goodstream, Minochinos, Callistanise, Cubeembed, Vimeos, CineSeguro)
-        return runCatching {
-            val hostHeader = cleanUrl.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}/" } ?: cleanUrl
-            val req = Request.Builder()
+        // 3. Extracción general con bypass de Referer, desobfuscación JS e inspección de Iframes
+        return@withContext runCatching {
+            val baseHost = cleanUrl.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}/" } ?: cleanUrl
+            
+            val request = Request.Builder()
                 .url(cleanUrl)
                 .header("User-Agent", USER_AGENT)
-                .header("Referer", hostHeader)
+                .header("Referer", baseHost)
                 .get()
                 .build()
 
-            val html = client.newCall(req).execute().use { it.body?.string().orEmpty() }
+            val rawHtml = client.newCall(request).execute().use { it.body?.string().orEmpty() }
+            if (rawHtml.isBlank()) return@runCatching cleanUrl
 
-            if (html.isNotBlank()) {
-                val m3u8Match = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(html)?.value
-                if (!m3u8Match.isNullOrBlank()) return@runCatching m3u8Match
+            // Desempaqueta scripts JS si están comprimidos con Dean Edwards Packer
+            val html = JsUnpacker.unpack(rawHtml)
 
-                val mp4Match = Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(html)?.value
-                if (!mp4Match.isNullOrBlank()) return@runCatching mp4Match
+            // Extractor específico para VOE
+            if (cleanUrl.contains("voe.sx") || cleanUrl.contains("/e/")) {
+                val voeMatch = Regex("""'hls':\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)
+                    ?: Regex("""const\s+sources\s*=\s*\{[^}]*["']?hls["']?\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+                if (!voeMatch.isNullOrBlank()) {
+                    return@runCatching if (voeMatch.startsWith("aHR0c")) String(Base64.decode(voeMatch, Base64.DEFAULT)) else voeMatch
+                }
+            }
 
-                val fileMatch = Regex("""file\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
-                if (!fileMatch.isNullOrBlank()) return@runCatching fileMatch
+            // Búsqueda de enlaces directos de vídeo .m3u8 o .mp4
+            val m3u8Match = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(html)?.value
+            if (!m3u8Match.isNullOrBlank()) return@runCatching m3u8Match
+
+            val mp4Match = Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(html)?.value
+            if (!mp4Match.isNullOrBlank()) return@runCatching mp4Match
+
+            val fileMatch = Regex("""file\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+            if (!fileMatch.isNullOrBlank()) return@runCatching fileMatch
+
+            // Si hay un iframe anidado, lo inspecciona recursivamente
+            val iframeSrc = Regex("""<iframe[^>]+src=["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+            if (!iframeSrc.isNullOrBlank() && !iframeSrc.startsWith("about:") && iframeSrc != cleanUrl) {
+                val fullIframeUrl = if (iframeSrc.startsWith("//")) "https:$iframeSrc" else iframeSrc
+                val iframeReq = Request.Builder().url(fullIframeUrl).header("Referer", cleanUrl).get().build()
+                val iframeHtml = client.newCall(iframeReq).execute().use { it.body?.string().orEmpty() }
+                val unpackedIframe = JsUnpacker.unpack(iframeHtml)
+
+                val subM3u8 = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(unpackedIframe)?.value
+                if (!subM3u8.isNullOrBlank()) return@runCatching subM3u8
+
+                val subMp4 = Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(unpackedIframe)?.value
+                if (!subMp4.isNullOrBlank()) return@runCatching subMp4
             }
 
             cleanUrl
@@ -555,11 +604,8 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     override suspend fun getVideo(server: Video.Server): Video {
-        val resolved = withContext(Dispatchers.IO) {
-            resolveCustomStreamUrl(server.src)
-        }
+        val resolved = resolveCustomStreamUrl(server.src)
 
-        // Intenta usar primero los extractores nativos de Streamflix y recurre al flujo resuelto si falla
         return runCatching {
             Extractor.extract(server.src, server)
         }.getOrElse {
