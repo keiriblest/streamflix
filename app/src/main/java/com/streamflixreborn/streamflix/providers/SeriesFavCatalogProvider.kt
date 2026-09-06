@@ -6,13 +6,15 @@ import com.streamflixreborn.streamflix.models.Episode
 import com.streamflixreborn.streamflix.models.Genre
 import com.streamflixreborn.streamflix.models.Movie
 import com.streamflixreborn.streamflix.models.People
+import com.streamflixreborn.streamflix.models.Season
 import com.streamflixreborn.streamflix.models.TvShow
 import com.streamflixreborn.streamflix.models.Video
-import com.streamflixreborn.streamflix.utils.DnsResolver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.security.MessageDigest
@@ -29,28 +31,20 @@ object SeriesFavCatalogProvider : Provider {
     private const val USER_AGENT =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-    @Serializable
     private data class SeriesFavEntry(
-        val titulo: String = "",
-        val imgURL: String? = null,
-        val temporada: String? = null,
-        val descripcion: String? = null,
-        val plataforma: String? = null,
-        val seccion: String? = null,
-        val fecha: String? = null,
-        val trailerURL: String? = null,
-        val verURL: String? = null
+        val titulo: String,
+        val imgURL: String?,
+        val temporada: String?,
+        val descripcion: String?,
+        val plataforma: String?,
+        val seccion: String?,
+        val fecha: String?,
+        val trailerURL: String?,
+        val verURL: String?
     )
-
-    private val json = Json {
-        ignoreUnknownKeys = true
-        isLenient = true
-        coerceInputValues = true
-    }
 
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .dns(DnsResolver.doh)
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .addInterceptor { chain ->
@@ -65,14 +59,12 @@ object SeriesFavCatalogProvider : Provider {
 
     private var cache: List<SeriesFavEntry> = emptyList()
 
-    // Solución al pantallazo negro: Mover la descarga a Dispatchers.IO (segundo plano)
     private suspend fun fetchCatalog(): List<SeriesFavEntry> {
         if (cache.isNotEmpty()) return cache
 
         return withContext(Dispatchers.IO) {
             val request = Request.Builder()
-                // Se añade un timestamp a la URL para forzar que baje la última versión del Gist y no use caché vieja
-                .url("$baseUrl?t=${System.currentTimeMillis()}") 
+                .url("$baseUrl?t=${System.currentTimeMillis()}")
                 .get()
                 .build()
 
@@ -84,16 +76,67 @@ object SeriesFavCatalogProvider : Provider {
 
             if (body.isNullOrBlank()) return@withContext emptyList()
 
-            val entries = runCatching {
-                json.decodeFromString<List<SeriesFavEntry>>(body)
-            }.getOrDefault(emptyList())
+            val entries = parseJsonToEntries(body)
 
             if (entries.isNotEmpty()) {
                 cache = entries
             }
-            
+
             entries
         }
+    }
+
+    private fun parseJsonToEntries(rawJson: String): List<SeriesFavEntry> {
+        return runCatching {
+            val jsonElement = Json.parseToJsonElement(rawJson)
+
+            val array = when (jsonElement) {
+                is JsonArray -> jsonElement
+                is JsonObject -> {
+                    jsonElement.values.firstOrNull { it is JsonArray } as? JsonArray ?: JsonArray(emptyList())
+                }
+                else -> JsonArray(emptyList())
+            }
+
+            array.mapNotNull { item ->
+                if (item !is JsonObject) return@mapNotNull null
+
+                fun JsonObject.getFlexString(vararg keys: String): String? {
+                    for (key in keys) {
+                        val value = this[key] ?: continue
+                        if (value is JsonPrimitive) {
+                            val content = value.content.trim()
+                            if (content.isNotBlank() && content != "null") {
+                                return content
+                            }
+                        }
+                    }
+                    return null
+                }
+
+                val titulo = item.getFlexString("titulo", "title", "name") ?: return@mapNotNull null
+                val imgURL = item.getFlexString("imgURL", "imgUrl", "poster", "image", "banner")
+                val temporada = item.getFlexString("temporada", "season")
+                val descripcion = item.getFlexString("descripcion", "overview", "description")
+                val plataforma = item.getFlexString("plataforma", "platform")
+                val seccion = item.getFlexString("seccion", "section", "category")
+                val fecha = item.getFlexString("fecha", "date", "year")
+                val trailerURL = item.getFlexString("trailerURL", "trailerUrl", "trailer")
+                val verURL = item.getFlexString("verURL", "verUrl", "url", "streamUrl", "link")
+
+                SeriesFavEntry(
+                    titulo = titulo,
+                    imgURL = imgURL,
+                    temporada = temporada,
+                    descripcion = descripcion,
+                    plataforma = plataforma,
+                    seccion = seccion,
+                    fecha = fecha,
+                    trailerURL = trailerURL,
+                    verURL = verURL
+                )
+            }
+        }.getOrDefault(emptyList())
     }
 
     private fun SeriesFavEntry.toId(): String {
@@ -104,14 +147,27 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     private fun SeriesFavEntry.toTvShow(): TvShow {
+        val showId = toId()
+        val seasonTitle = temporada?.takeIf { it.isNotBlank() } ?: "Temporada 1"
+        val seasonNum = seasonTitle.filter { it.isDigit() }.toIntOrNull() ?: 1
+
+        val seasonsList = listOf(
+            Season(
+                id = "$showId:s$seasonNum",
+                number = seasonNum,
+                title = seasonTitle
+            )
+        )
+
         return TvShow(
-            id = toId(),
+            id = showId,
             title = titulo,
             overview = descripcion,
             released = fecha?.takeIf { it.isNotBlank() },
             trailer = trailerURL,
             poster = imgURL,
             banner = imgURL,
+            seasons = seasonsList
         ).apply {
             providerName = name
         }
@@ -131,7 +187,7 @@ object SeriesFavCatalogProvider : Provider {
         val grouped = entries.groupBy { entry ->
             entry.seccion?.takeIf { it.isNotBlank() }
                 ?: entry.plataforma?.takeIf { it.isNotBlank() }
-                ?: "SeriesFav Catalog"
+                ?: "Catálogo SeriesFav"
         }
 
         return grouped.map { (sectionName, sectionEntries) ->
@@ -157,22 +213,25 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     override suspend fun getMovie(id: String): Movie {
-        throw UnsupportedOperationException("SeriesFav Catalog only provides TV shows")
+        throw UnsupportedOperationException("SeriesFav Catalog solo ofrece series")
     }
 
     override suspend fun getTvShow(id: String): TvShow {
-        val entry = fetchCatalog().firstOrNull { it.toId() == id }
-            ?: throw NoSuchElementException("SeriesFav Catalog: show not found")
+        val cleanId = id.substringBefore(":s").substringBefore(":ep")
+        val entry = fetchCatalog().firstOrNull { it.toId() == cleanId }
+            ?: throw NoSuchElementException("SeriesFav Catalog: Serie no encontrada")
         return entry.toTvShow()
     }
 
     override suspend fun getEpisodesBySeason(seasonId: String): List<Episode> {
-        val entry = fetchCatalog().firstOrNull { it.toId() == seasonId } ?: return emptyList()
-        val url = entry.verURL?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val cleanId = seasonId.substringBefore(":s").substringBefore(":ep")
+        val entry = fetchCatalog().firstOrNull { it.toId() == cleanId } ?: return emptyList()
+        
+        if (entry.verURL.isNullOrBlank()) return emptyList()
 
         return listOf(
             Episode(
-                id = seasonId,
+                id = "$cleanId:ep1",
                 number = 1,
                 title = entry.titulo,
                 poster = entry.imgURL
@@ -181,15 +240,16 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     override suspend fun getGenre(id: String, page: Int): Genre {
-        throw UnsupportedOperationException("SeriesFav Catalog does not support genres")
+        throw UnsupportedOperationException("SeriesFav Catalog no soporta géneros")
     }
 
     override suspend fun getPeople(id: String, page: Int): People {
-        throw UnsupportedOperationException("SeriesFav Catalog does not support people")
+        throw UnsupportedOperationException("SeriesFav Catalog no soporta personas")
     }
 
     override suspend fun getServers(id: String, videoType: Video.Type): List<Video.Server> {
-        val entry = fetchCatalog().firstOrNull { it.toId() == id } ?: return emptyList()
+        val cleanId = id.substringBefore(":s").substringBefore(":ep")
+        val entry = fetchCatalog().firstOrNull { it.toId() == cleanId } ?: return emptyList()
         val playbackUrl = entry.verURL?.takeIf { it.isNotBlank() } ?: return emptyList()
 
         return listOf(
