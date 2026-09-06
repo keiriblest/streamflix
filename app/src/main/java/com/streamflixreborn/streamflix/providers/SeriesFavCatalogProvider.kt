@@ -17,6 +17,10 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -161,9 +165,6 @@ object SeriesFavCatalogProvider : Provider {
                 val trailerURL = item.getFlexString("trailerURL", "trailerUrl", "trailer")
                 val tipo = item.getFlexString("tipo", "type")
 
-                val isMovie = isMovieCheck(tipo, seccion, plataforma, temporada)
-                val entrySeasonNum = parseSeasonNumber(temporada)
-
                 val directUrls = mutableListOf<String>()
                 val parsedEpisodes = mutableListOf<ParsedEpisode>()
 
@@ -195,6 +196,13 @@ object SeriesFavCatalogProvider : Provider {
                     else -> {}
                 }
 
+                // Regla solicitada: Si tiene plataforma o enlace pero no tiene temporadas ni episodios, es Película
+                val isExplicitMovie = isMovieCheck(tipo, seccion, plataforma, temporada)
+                val isImplicitMovie = parsedEpisodes.isEmpty() && directUrls.isNotEmpty() && (temporada.isNullOrBlank() || temporada.lowercase() == "null")
+                val isMovie = isExplicitMovie || isImplicitMovie
+
+                val entrySeasonNum = parseSeasonNumber(temporada)
+
                 SeriesFavEntry(
                     titulo = titulo,
                     imgURL = imgURL,
@@ -220,10 +228,9 @@ object SeriesFavCatalogProvider : Provider {
         return "seriesfav:$digest"
     }
 
-    // Inspirado en SeriesFlix: Limpieza y desenvolvimiento de URLs
     private fun unwrapUrl(rawUrl: String): String {
         var clean = rawUrl.trim()
-        if (clean.startsWith("aHR0c")) { // Detección Base64
+        if (clean.startsWith("aHR0c")) {
             clean = runCatching {
                 String(Base64.decode(clean, Base64.DEFAULT)).trim()
             }.getOrDefault(clean)
@@ -236,20 +243,23 @@ object SeriesFavCatalogProvider : Provider {
         return clean
     }
 
-    // Inspirado en SeriesFlix: Extracción limpia de nombres de servidor
     private fun extractHostLabel(value: String): String {
         return runCatching {
             val host = value.toHttpUrlOrNull()?.host.orEmpty()
                 .removePrefix("www.")
                 .substringBefore(".")
             when {
-                host.contains("hglink", ignoreCase = true) -> "HGLink"
                 host.contains("goodstream", ignoreCase = true) -> "Goodstream"
-                host.contains("dailymotion", ignoreCase = true) || host.contains("dai", ignoreCase = true) -> "Dailymotion"
                 host.contains("ok", ignoreCase = true) -> "Ok.ru"
+                host.contains("minochinos", ignoreCase = true) -> "Minochinos"
+                host.contains("callistanise", ignoreCase = true) -> "Callistanise"
+                host.contains("drive.google", ignoreCase = true) -> "Google Drive"
+                host.contains("vimeos", ignoreCase = true) -> "Vimeos"
                 host.contains("voe", ignoreCase = true) -> "VOE"
-                host.contains("streamtape", ignoreCase = true) -> "Streamtape"
-                host.contains("mega", ignoreCase = true) -> "MEGA"
+                host.contains("rpmvid", ignoreCase = true) || host.contains("cubeembed", ignoreCase = true) -> "CubeEmbed"
+                host.contains("cine-seguro", ignoreCase = true) -> "CineSeguro"
+                host.contains("sendvid", ignoreCase = true) -> "Sendvid"
+                host.contains("hglink", ignoreCase = true) -> "HGLink"
                 host.isBlank() -> "Servidor"
                 else -> host.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
             }
@@ -320,11 +330,18 @@ object SeriesFavCatalogProvider : Provider {
             }
         }
 
+        // Asignación de la imagen correspondiente a cada temporada específica del Gist
         val seasons = seasonNumbers.sorted().map { sNum ->
+            val matchingEntry = sameTitleEntries.firstOrNull { 
+                it.entrySeasonNum == sNum || it.episodesList.any { ep -> ep.seasonNum == sNum } 
+            }
+            val seasonPoster = matchingEntry?.imgURL?.takeIf { it.isNotBlank() } ?: first.imgURL
+
             Season(
                 id = "$showId:s$sNum",
                 number = sNum,
-                title = "Temporada $sNum"
+                title = "Temporada $sNum",
+                poster = seasonPoster
             )
         }
 
@@ -453,7 +470,6 @@ object SeriesFavCatalogProvider : Provider {
             }
         }
 
-        // Método idéntico a SeriesFlix: asignar src con la URL limpia e id de servidor formateado
         return rawUrls.distinctBy { it.first }.mapIndexed { index, (url, platform) ->
             val cleanUrl = unwrapUrl(url)
             val hostLabel = extractHostLabel(cleanUrl)
@@ -467,12 +483,87 @@ object SeriesFavCatalogProvider : Provider {
         }
     }
 
-    // Utiliza el motor nativo de extractores de Streamflix
+    /**
+     * Resolutor multitarget optimizado para Google Drive, Ok.ru, Sendvid, Voe, Goodstream, Minochinos, etc.
+     */
+    private fun resolveCustomStreamUrl(url: String): String {
+        val cleanUrl = url.trim()
+        if (cleanUrl.isBlank()) return url
+
+        // 1. Google Drive Direct Converter
+        if (cleanUrl.contains("drive.google.com")) {
+            val fileId = Regex("""/file/d/([a-zA-Z0-9_-]+)""").find(cleanUrl)?.groupValues?.get(1)
+            if (!fileId.isNullOrBlank()) {
+                return "https://drive.google.com/uc?export=download&id=$fileId"
+            }
+        }
+
+        // 2. Ok.ru JSON Metadata Extractor
+        if (cleanUrl.contains("ok.ru")) {
+            val videoId = cleanUrl.substringAfter("videoembed/").substringAfter("video/").substringBefore("?").substringBefore("/")
+            if (videoId.isNotBlank() && videoId.all { it.isDigit() }) {
+                runCatching {
+                    val metaUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
+                    val req = Request.Builder().url(metaUrl).post(FormBody.Builder().build()).build()
+                    val resp = client.newCall(req).execute().use { it.body?.string() }
+                    if (!resp.isNullOrBlank()) {
+                        val jsonElem = Json.parseToJsonElement(resp)
+                        val videos = jsonElem.jsonObject["videos"]?.jsonArray
+                        val highestVideo = videos?.lastOrNull()?.jsonObject?.get("url")?.jsonPrimitive?.content
+                        if (!highestVideo.isNullOrBlank()) return highestVideo
+                    }
+                }
+            }
+        }
+
+        // 3. Sendvid Direct Video Extraction
+        if (cleanUrl.contains("sendvid.com")) {
+            runCatching {
+                val req = Request.Builder().url(cleanUrl).header("User-Agent", USER_AGENT).get().build()
+                val html = client.newCall(req).execute().use { it.body?.string().orEmpty() }
+                val srcMatch = Regex("""<source[^>]+src=["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+                    ?: Regex("""var\s+video_url\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+                if (!srcMatch.isNullOrBlank()) return srcMatch
+            }
+        }
+
+        // 4. Extractor HTML genérico (Goodstream, Minochinos, Callistanise, Cubeembed, Vimeos, CineSeguro)
+        return runCatching {
+            val hostHeader = cleanUrl.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}/" } ?: cleanUrl
+            val req = Request.Builder()
+                .url(cleanUrl)
+                .header("User-Agent", USER_AGENT)
+                .header("Referer", hostHeader)
+                .get()
+                .build()
+
+            val html = client.newCall(req).execute().use { it.body?.string().orEmpty() }
+
+            if (html.isNotBlank()) {
+                val m3u8Match = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(html)?.value
+                if (!m3u8Match.isNullOrBlank()) return@runCatching m3u8Match
+
+                val mp4Match = Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(html)?.value
+                if (!mp4Match.isNullOrBlank()) return@runCatching mp4Match
+
+                val fileMatch = Regex("""file\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+                if (!fileMatch.isNullOrBlank()) return@runCatching fileMatch
+            }
+
+            cleanUrl
+        }.getOrDefault(cleanUrl)
+    }
+
     override suspend fun getVideo(server: Video.Server): Video {
+        val resolved = withContext(Dispatchers.IO) {
+            resolveCustomStreamUrl(server.src)
+        }
+
+        // Intenta usar primero los extractores nativos de Streamflix y recurre al flujo resuelto si falla
         return runCatching {
             Extractor.extract(server.src, server)
-        }.getOrDefault(
-            Video(source = server.src)
-        )
+        }.getOrElse {
+            Video(source = resolved)
+        }
     }
 }
