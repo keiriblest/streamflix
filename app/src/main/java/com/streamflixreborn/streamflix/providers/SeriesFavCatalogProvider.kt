@@ -221,14 +221,13 @@ object SeriesFavCatalogProvider : Provider {
     private fun getProviderNameFromUrl(url: String, defaultName: String?): String {
         val lower = url.lowercase()
         return when {
+            lower.contains("hglink") -> "HGLink"
+            lower.contains("goodstream") -> "Goodstream"
             lower.contains("dailymotion") || lower.contains("dai.ly") -> "Dailymotion"
-            lower.contains("ok.ru") || lower.contains("odnoklassniki") -> "Ok.ru"
+            lower.contains("ok.ru") -> "Ok.ru"
             lower.contains("streamtape") -> "Streamtape"
-            lower.contains("voe.sx") || lower.contains("voe.inc") -> "VOE"
-            lower.contains("mega.nz") || lower.contains("mega.co") -> "MEGA"
-            lower.contains("fembed") || lower.contains("feurl") -> "Fembed"
-            lower.contains("mixdrop") -> "Mixdrop"
-            lower.contains("dood") -> "Doodstream"
+            lower.contains("voe") -> "VOE"
+            lower.contains("mega") -> "MEGA"
             !defaultName.isNullOrBlank() -> defaultName
             else -> "Servidor Principal"
         }
@@ -241,10 +240,10 @@ object SeriesFavCatalogProvider : Provider {
         val categories = mutableListOf<Category>()
 
         val movieEntries = entries.filter { it.isMovie }
-            if (movieEntries.isNotEmpty()) {
-                val moviesList = movieEntries.distinctBy { it.titulo.lowercase().trim() }.map { createMovieObject(it) }
-                categories.add(Category("Películas", moviesList))
-            }
+        if (movieEntries.isNotEmpty()) {
+            val moviesList = movieEntries.distinctBy { it.titulo.lowercase().trim() }.map { createMovieObject(it) }
+            categories.add(Category("Películas", moviesList))
+        }
 
         val seriesEntries = entries.filter { !it.isMovie }
         val groupedSeries = seriesEntries.groupBy { entry ->
@@ -450,18 +449,17 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     /**
-     * Extractor genérico de flujos de video (.m3u8 / .mp4) para Dailymotion, Ok.ru y servidores Embed.
+     * Resuelve los enlaces de hglink.to, goodstream.one y Dailymotion a transmisiones .m3u8/.mp4
      */
     private fun resolveStreamUrl(url: String): String {
         val cleanUrl = url.trim()
         if (cleanUrl.isBlank()) return url
 
-        // 1. Si es un enlace directo de vídeo, devolverlo inmediatamente
         if (cleanUrl.endsWith(".m3u8") || cleanUrl.endsWith(".mp4") || cleanUrl.endsWith(".mkv")) {
             return cleanUrl
         }
 
-        // 2. Extractor específico para Dailymotion
+        // Extractor Dailymotion
         if (cleanUrl.contains("dailymotion.com") || cleanUrl.contains("dai.ly")) {
             val videoId = when {
                 cleanUrl.contains("/embed/video/") -> cleanUrl.substringAfter("/embed/video/").substringBefore("?").substringBefore("/")
@@ -496,26 +494,34 @@ object SeriesFavCatalogProvider : Provider {
             }
         }
 
-        // 3. Extractor genérico (Scrapea el HTML del reproductor buscando flujos .m3u8 o .mp4)
+        // Extractor genérico para hglink.to, goodstream.one y similares
         return runCatching {
-            val request = Request.Builder()
+            val requestBuilder = Request.Builder()
                 .url(cleanUrl)
                 .header("User-Agent", USER_AGENT)
-                .header("Referer", cleanUrl)
-                .get()
-                .build()
 
-            val html = client.newCall(request).execute().use { res ->
+            when {
+                cleanUrl.contains("hglink.to") -> requestBuilder.header("Referer", "https://hglink.to/")
+                cleanUrl.contains("goodstream.one") -> requestBuilder.header("Referer", "https://goodstream.one/")
+                else -> requestBuilder.header("Referer", cleanUrl)
+            }
+
+            val html = client.newCall(requestBuilder.build()).execute().use { res ->
                 if (res.isSuccessful) res.body?.string() else null
             }
 
             if (!html.isNullOrBlank()) {
-                // Busca URLs .m3u8 ocultas en la estructura del reproductor HTML
+                // Extracción de file: "https://..." típico en JWPlayer o HTML5 players
+                val jsFileRegex = Regex("""file\s*:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""")
+                val jsMatch = jsFileRegex.find(html)?.groupValues?.get(1)
+                if (!jsMatch.isNullOrBlank()) return@runCatching jsMatch
+
+                // Extracción de fuentes m3u8 generales
                 val m3u8Regex = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""")
                 val m3u8Match = m3u8Regex.find(html)?.value
                 if (!m3u8Match.isNullOrBlank()) return@runCatching m3u8Match
 
-                // Busca URLs .mp4 directas en la estructura del reproductor HTML
+                // Extracción de fuentes mp4 generales
                 val mp4Regex = Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""")
                 val mp4Match = mp4Regex.find(html)?.value
                 if (!mp4Match.isNullOrBlank()) return@runCatching mp4Match
