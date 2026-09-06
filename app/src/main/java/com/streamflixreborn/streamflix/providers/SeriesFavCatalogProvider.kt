@@ -146,10 +146,39 @@ object SeriesFavCatalogProvider : Provider {
         return "seriesfav:$digest"
     }
 
+    // Detecta si la entrada es una película para habilitar el botón "Ver ahora" directo
+    private fun SeriesFavEntry.isMovie(): Boolean {
+        val sec = seccion?.lowercase().orEmpty()
+        val temp = temporada?.lowercase().orEmpty()
+        return sec.contains("pelicula") || sec.contains("película") ||
+               temp.contains("pelicula") || temp.contains("película")
+    }
+
+    private fun SeriesFavEntry.toMovie(): Movie {
+        return Movie(
+            id = toId(),
+            title = titulo,
+            overview = descripcion,
+            released = fecha?.takeIf { it.isNotBlank() },
+            trailer = trailerURL,
+            poster = imgURL,
+            banner = imgURL,
+        ).apply {
+            providerName = name
+        }
+    }
+
     private fun SeriesFavEntry.toTvShow(): TvShow {
         val showId = toId()
-        val seasonTitle = temporada?.takeIf { it.isNotBlank() } ?: "Temporada 1"
-        val seasonNum = seasonTitle.filter { it.isDigit() }.toIntOrNull() ?: 1
+        
+        val rawSeason = temporada?.trim().orEmpty()
+        val seasonNum = rawSeason.filter { it.isDigit() }.toIntOrNull() ?: 1
+        val seasonTitle = when {
+            rawSeason.isBlank() -> "Temporada 1"
+            rawSeason.lowercase().startsWith("temporada") -> rawSeason
+            rawSeason.all { it.isDigit() } -> "Temporada $rawSeason"
+            else -> rawSeason
+        }
 
         val seasonsList = listOf(
             Season(
@@ -173,6 +202,10 @@ object SeriesFavCatalogProvider : Provider {
         }
     }
 
+    private fun SeriesFavEntry.toItem(): AppAdapter.Item {
+        return if (isMovie()) toMovie() else toTvShow()
+    }
+
     private fun matches(entry: SeriesFavEntry, query: String): Boolean {
         if (query.isBlank()) return true
         val needle = query.trim().lowercase()
@@ -193,7 +226,7 @@ object SeriesFavCatalogProvider : Provider {
         return grouped.map { (sectionName, sectionEntries) ->
             Category(
                 name = sectionName,
-                list = sectionEntries.map { it.toTvShow() }
+                list = sectionEntries.map { it.toItem() }
             )
         }
     }
@@ -202,18 +235,24 @@ object SeriesFavCatalogProvider : Provider {
         if (page > 1) return emptyList()
         return fetchCatalog()
             .filter { matches(it, query) }
-            .map { it.toTvShow() }
+            .map { it.toItem() }
     }
 
-    override suspend fun getMovies(page: Int): List<Movie> = emptyList()
+    override suspend fun getMovies(page: Int): List<Movie> {
+        if (page > 1) return emptyList()
+        return fetchCatalog().filter { it.isMovie() }.map { it.toMovie() }
+    }
 
     override suspend fun getTvShows(page: Int): List<TvShow> {
         if (page > 1) return emptyList()
-        return fetchCatalog().map { it.toTvShow() }
+        return fetchCatalog().filter { !it.isMovie() }.map { it.toTvShow() }
     }
 
     override suspend fun getMovie(id: String): Movie {
-        throw UnsupportedOperationException("SeriesFav Catalog solo ofrece series")
+        val cleanId = id.substringBefore(":s").substringBefore(":ep")
+        val entry = fetchCatalog().firstOrNull { it.toId() == cleanId }
+            ?: throw NoSuchElementException("SeriesFav Catalog: Película no encontrada")
+        return entry.toMovie()
     }
 
     override suspend fun getTvShow(id: String): TvShow {
@@ -234,6 +273,7 @@ object SeriesFavCatalogProvider : Provider {
                 id = "$cleanId:ep1",
                 number = 1,
                 title = entry.titulo,
+                overview = entry.descripcion,
                 poster = entry.imgURL
             )
         )
