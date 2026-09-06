@@ -9,6 +9,8 @@ import com.streamflixreborn.streamflix.models.People
 import com.streamflixreborn.streamflix.models.TvShow
 import com.streamflixreborn.streamflix.models.Video
 import com.streamflixreborn.streamflix.utils.DnsResolver
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
@@ -37,7 +39,7 @@ object SeriesFavCatalogProvider : Provider {
         val seccion: String? = null,
         val fecha: String? = null,
         val trailerURL: String? = null,
-        val verURL: String? = null // Incluido para recuperar las URLs de reproducción
+        val verURL: String? = null
     )
 
     private val json = Json {
@@ -61,29 +63,37 @@ object SeriesFavCatalogProvider : Provider {
             .build()
     }
 
-    private var cache: List<SeriesFavEntry>? = null
+    private var cache: List<SeriesFavEntry> = emptyList()
 
-    private fun fetchCatalog(): List<SeriesFavEntry> {
-        cache?.let { return it }
+    // Solución al pantallazo negro: Mover la descarga a Dispatchers.IO (segundo plano)
+    private suspend fun fetchCatalog(): List<SeriesFavEntry> {
+        if (cache.isNotEmpty()) return cache
 
-        val request = Request.Builder()
-            .url(baseUrl)
-            .get()
-            .build()
+        return withContext(Dispatchers.IO) {
+            val request = Request.Builder()
+                // Se añade un timestamp a la URL para forzar que baje la última versión del Gist y no use caché vieja
+                .url("$baseUrl?t=${System.currentTimeMillis()}") 
+                .get()
+                .build()
 
-        val body = client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return emptyList()
-            response.body?.string().orEmpty()
+            val body = runCatching {
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) response.body?.string() else null
+                }
+            }.getOrNull()
+
+            if (body.isNullOrBlank()) return@withContext emptyList()
+
+            val entries = runCatching {
+                json.decodeFromString<List<SeriesFavEntry>>(body)
+            }.getOrDefault(emptyList())
+
+            if (entries.isNotEmpty()) {
+                cache = entries
+            }
+            
+            entries
         }
-
-        if (body.isBlank()) return emptyList()
-
-        val entries = runCatching {
-            json.decodeFromString<List<SeriesFavEntry>>(body)
-        }.getOrDefault(emptyList())
-
-        cache = entries
-        return entries
     }
 
     private fun SeriesFavEntry.toId(): String {
@@ -191,7 +201,6 @@ object SeriesFavCatalogProvider : Provider {
     }
 
     override suspend fun getVideo(server: Video.Server): Video {
-        // Corrección de los parámetros solicitados por el compilador
         return Video(
             source = server.id
         )
