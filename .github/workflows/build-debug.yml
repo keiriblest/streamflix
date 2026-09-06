@@ -1,0 +1,53 @@
+name: Build Debug APK (SeriesFav)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-debug-apk:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK environment
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: 17
+
+      - name: Access Secrets
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          RABBITSTREAM_SOURCE_API: ${{ secrets.RABBITSTREAM_SOURCE_API }}
+        run: |
+          echo APP_LAYOUT=default >> local.properties
+          echo TMDB_API_KEY=$TMDB_API_KEY >> local.properties
+          echo RABBITSTREAM_SOURCE_API=$RABBITSTREAM_SOURCE_API >> local.properties
+
+      - name: Generate native-lib.cpp from template
+        env:
+          UPROT_MSFI_API_BASE: ${{ secrets.UPROT_MSFI_API_BASE }}
+          UPROT_MSE_API_BASE: ${{ secrets.UPROT_MSE_API_BASE }}
+          UPROT_API_KEY: ${{ secrets.UPROT_API_KEY }}
+        run: |
+          sed -e "s|{{UPROT_MSFI_API_BASE}}|$UPROT_MSFI_API_BASE|g" \
+              -e "s|{{UPROT_MSE_API_BASE}}|$UPROT_MSE_API_BASE|g" \
+              -e "s|{{UPROT_API_KEY}}|$UPROT_API_KEY|g" \
+              app/src/main/cpp/native-lib.cpp.template > app/src/main/cpp/native-lib.cpp
+
+      - name: Make Gradle executable
+        run: chmod +x ./gradlew
+
+      - name: Build Debug APK (unsigned, no keystore needed)
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload Debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamflix-seriesfav-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
